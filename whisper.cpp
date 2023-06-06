@@ -2434,6 +2434,75 @@ static void log_mel_spectrogram_worker_thread(int ith, const std::vector<float> 
     }
 }
 
+static void mel_spectrogram_with_speed(int ith, const std::vector<float> &hann, const float *samples,
+                                       int n_samples, int fft_size, int fft_step, int n_threads,
+                                       const whisper_filters &filters, int32_t speed, whisper_mel &mel) {
+    std::vector<float> fft_in(fft_size, 0.0);
+    std::vector<float> fft_out(2 * fft_size);
+    int n_fft = 1 + fft_size / 2*speed ;
+
+    for (int i = ith; i < mel.n_len; i += n_threads) {
+        const int offset = i * fft_step;
+
+        // apply Hanning window
+        for (int j = 0; j < fft_size ; j++) { // Adjust loop for speed
+            if (offset + j < n_samples) {
+                fft_in[j] = hann[j] * samples[offset + j];
+            } else {
+                fft_in[j] = 0.0;
+            }
+        }
+
+        // FFT -> mag^2
+        fft(fft_in, fft_out);
+
+        for (int j = 0; j < fft_size; j++) {
+            fft_out[j] = (fft_out[2 * j + 0] * fft_out[2 * j + 0] + fft_out[2 * j + 1] * fft_out[2 * j + 1]);
+        }
+        for (int j = 1; j < fft_size / 2; j++) {
+            fft_out[j] += fft_out[fft_size - j];
+        }
+
+        if (speed > 1) {
+            // scale down in the frequency domain results in a speed up in the time domain
+            for (int j = 0; j < n_fft; j++) {
+                int start = j * speed;
+                int end = std::min((j + 1) * speed, n_fft);
+        
+                fft_out[j] = 0.0;
+                for (int k = start; k < end; k++) {
+                    fft_out[j] += fft_out[k];
+                }
+                fft_out[j] /= (end - start);
+            }
+        }
+
+        // mel spectrogram
+        for (int j = 0; j < mel.n_mel; j++) {
+            double sum = 0.0;
+
+            // unroll loop (suggested by GH user @lunixbochs)
+            int k = 0;
+            for (k = 0; k < n_fft - 3; k += 4) {
+                sum +=
+                    fft_out[k + 0] * filters.data[j*n_fft + k + 0] +
+                    fft_out[k + 1] * filters.data[j*n_fft + k + 1] +
+                    fft_out[k + 2] * filters.data[j*n_fft + k + 2] +
+                    fft_out[k + 3] * filters.data[j*n_fft + k + 3];
+            }
+
+            // handle n_fft remainder
+            for (; k < n_fft; k++) {
+                sum += fft_out[k] * filters.data[j * n_fft + k];
+            }
+
+            sum = log10(std::max(sum, 1e-10));
+
+            mel.data[j * mel.n_len + i] = sum;
+        }
+    }
+}
+
 // ref: https://github.com/openai/whisper/blob/main/whisper/audio.py#L92-L124
 static bool log_mel_spectrogram(
           whisper_state & wstate,
@@ -2445,15 +2514,19 @@ static bool log_mel_spectrogram(
               const int   n_mel,
               const int   n_threads,
   const whisper_filters & filters,
-             const bool   speed_up,
+             const int32_t speed,
             whisper_mel & mel) {
     const int64_t t_start_us = ggml_time_us();
 
+    // Calculate new FFT size and step based on speed, clamp within reasonable limits
+    const int new_fft_size = std::max(32, std::min(fft_size * speed, 8192));
+    const int new_fft_step = fft_step * new_fft_size / fft_size;
+
     // Hanning window
     std::vector<float> hann;
-    hann.resize(fft_size);
-    for (int i = 0; i < fft_size; i++) {
-        hann[i] = 0.5*(1.0 - cos((2.0*M_PI*i)/(fft_size)));
+    hann.resize(new_fft_size);
+    for (int i = 0; i < new_fft_size; i++) {
+        hann[i] = 0.5*(1.0 - cos((2.0*M_PI*i)/(new_fft_size)));
     }
 
     mel.n_mel     = n_mel;
@@ -2487,13 +2560,13 @@ static bool log_mel_spectrogram(
         std::vector<std::thread> workers(n_threads - 1);
         for (int iw = 0; iw < n_threads - 1; ++iw) {
             workers[iw] = std::thread(
-                    log_mel_spectrogram_worker_thread, iw + 1, std::cref(hann), samples,
-                    n_samples, fft_size, fft_step, n_threads,
-                    std::cref(filters), speed_up, std::ref(mel));
+                    mel_spectrogram_with_speed, iw + 1, std::cref(hann), samples, // Updated function name and passed speed
+                    n_samples, new_fft_size, new_fft_step, n_threads,
+                    std::cref(filters), speed, std::ref(mel)); // Passed speed
         }
 
         // main thread
-        log_mel_spectrogram_worker_thread(0, hann, samples, n_samples, fft_size, fft_step, n_threads, filters, speed_up, mel);
+        mel_spectrogram_with_speed(0, hann, samples, n_samples, new_fft_size, new_fft_step, n_threads, filters, speed, mel); // Updated function name and passed speed
 
         for (int iw = 0; iw < n_threads - 1; ++iw) {
             workers[iw].join();
@@ -2859,7 +2932,7 @@ void whisper_free_params(struct whisper_full_params * params) {
 }
 
 int whisper_pcm_to_mel_with_state(struct whisper_context * ctx, struct whisper_state * state, const float * samples, int n_samples, int n_threads) {
-    if (!log_mel_spectrogram(*state, samples, n_samples, WHISPER_SAMPLE_RATE, WHISPER_N_FFT, WHISPER_HOP_LENGTH, WHISPER_N_MEL, n_threads, ctx->model.filters, false, state->mel)) {
+    if (!log_mel_spectrogram(*state, samples, n_samples, WHISPER_SAMPLE_RATE, WHISPER_N_FFT, WHISPER_HOP_LENGTH, WHISPER_N_MEL, n_threads, ctx->model.filters, 1, state->mel)) {
         fprintf(stderr, "%s: failed to compute mel spectrogram\n", __func__);
         return -1;
     }
@@ -2873,7 +2946,7 @@ int whisper_pcm_to_mel(struct whisper_context * ctx, const float * samples, int 
 
 // same as whisper_pcm_to_mel, but applies a Phase Vocoder to speed up the audio x2
 int whisper_pcm_to_mel_phase_vocoder_with_state(struct whisper_context * ctx, struct whisper_state * state, const float * samples, int n_samples, int n_threads) {
-    if (!log_mel_spectrogram(*state, samples, n_samples, WHISPER_SAMPLE_RATE, 2 * WHISPER_N_FFT, 2 * WHISPER_HOP_LENGTH, WHISPER_N_MEL, n_threads, ctx->model.filters, true, state->mel)) {
+    if (!log_mel_spectrogram(*state, samples, n_samples, WHISPER_SAMPLE_RATE, 2 * WHISPER_N_FFT, 2 * WHISPER_HOP_LENGTH, WHISPER_N_MEL, n_threads, ctx->model.filters, 1, state->mel)) {
         fprintf(stderr, "%s: failed to compute mel spectrogram\n", __func__);
         return -1;
     }
